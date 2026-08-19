@@ -21,6 +21,14 @@ Available Competitions, Competition Detail, Apply, and Application Status — ea
 * whether it meets the ≤ 5 ms acceptance target
 * the measurement date, sample count and percentiles behind every figure
 
+And, as the detail layer, **every individual database statement**: its category, which
+screens it runs on and how many times, its p50/p95/p99 in both states, whether it still
+executes, and — from the recorded access plan, not from the timing — whether it is healthy.
+
+Statements are named semantically (`limiter.key_read`, `auth.user_lookup`,
+`business.registration_read`). The parameterised statement text is not published and is not
+reconstructed anywhere in this repository.
+
 ---
 
 ## ⛔ File limiter — local isolation pilot, **not** production architecture
@@ -56,6 +64,18 @@ streamlit run app.py
 ```
 
 Then open the URL Streamlit prints (by default <http://localhost:8501>).
+
+To check the evidence rather than take it on trust:
+
+```bash
+python verify.py
+```
+
+It proves the displayed figures are derived rather than written in — by breaking a
+*disposable copy* of the evidence and confirming the results break in the matching way
+(altering one query's samples moves only that query and only the screen it runs on; removing
+a query produces a visible gap rather than a cheaper screen), then confirming the real
+artifacts are byte-identical afterwards.
 
 Nothing else is required. There is no database to create, no environment file to fill in and
 no service to start.

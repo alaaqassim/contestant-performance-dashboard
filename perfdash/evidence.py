@@ -24,7 +24,7 @@ import json
 from pathlib import Path
 from typing import Any
 
-from . import schema, ui_pages
+from . import schema, stats, ui_pages
 
 #: `parents[1]` is the snapshot root — never an absolute path, never a drive letter.
 DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -177,3 +177,309 @@ ARABIC_TITLES = {
     "apply": "التقديم على المسابقة",
     "application_status": "حالة الطلب",
 }
+
+
+# ======================================================================================
+# Query-level view
+# ======================================================================================
+#
+# The screens are what a contestant experiences; the QUERY SHAPES are what the database
+# actually executes. This section resolves the second, and everything it returns is derived
+# from the two evidence files — no timing, count or percentage is declared here.
+#
+# A shape is named SEMANTICALLY (`auth.user_lookup`, `limiter.key_read`). The statement text
+# is not in the artifact and is not reconstructed.
+
+#: Bucket -> the category the presentation uses.
+CATEGORY = {
+    ui_pages.LIMITER: "Rate Limiter",
+    ui_pages.AUTH: "Authentication",
+    ui_pages.BUSINESS: "Business",
+}
+
+#: Bucket -> the prefix a shape is displayed under.
+PREFIX = {
+    ui_pages.LIMITER: "limiter",
+    ui_pages.AUTH: "auth",
+    ui_pages.BUSINESS: "business",
+}
+
+STATUS_REMOVED = "REMOVED FROM SQL PATH"
+STATUS_ACTIVE = "STILL ACTIVE"
+STATUS_CONDITIONAL = "CONDITIONAL — NOT YET MEASURED"
+
+
+def _stats(record: dict[str, Any] | None) -> dict[str, Any]:
+    """p50 / p95 / p99 / n for one record, or all-None when there is no record.
+
+    None is not zero. A shape with no measurement must render as blank, never as 0.0000.
+    """
+    summary = stats.stats_for(record) if record else None
+    if not summary:
+        return {"p50": None, "p95": None, "p99": None, "n": 0}
+    return {
+        "p50": summary.get("median_ms"),
+        "p95": summary.get("p95_ms"),
+        "p99": summary.get("p99_ms"),
+        "n": int(summary.get("n") or 0),
+    }
+
+
+def _screen_map() -> dict[tuple[str, str], dict[str, int]]:
+    """(operation, component) -> {screen key: executions on that screen}."""
+    out: dict[tuple[str, str], dict[str, int]] = {}
+    for page in ui_pages.PAGES:
+        for row in page["rows"]:
+            out.setdefault((row["operation"], row["component"]), {})[page["key"]] = \
+                row["executions"]
+    return out
+
+
+def _bucket_of(operation: str, component: str) -> str:
+    for page in ui_pages.PAGES:
+        for row in page["rows"]:
+            if (row["operation"], row["component"]) == (operation, component):
+                return row["bucket"]
+    return ui_pages.BUSINESS
+
+
+def health(record: dict[str, Any] | None) -> tuple[str, str]:
+    """(verdict, why) for one shape, derived ONLY from what the artifact records.
+
+    The inputs are the access-plan class, the rows examined, and the dataset-scope evidence
+    tag the measurement carries. Nothing is inferred from the timing alone, and no EXPLAIN
+    is re-run or invented: if the artifact does not say, this returns "not recorded".
+    """
+    if not record:
+        return "—", "no measurement"
+
+    db = record.get("database") or {}
+    tags = set(record.get("evidence") or [])
+    access = db.get("access_type")
+    rows = db.get("rows_examined")
+    indexed = db.get("indexed")
+
+    if access is None:
+        return "NOT RECORDED", "the artifact carries no access plan for this shape"
+
+    if db.get("write"):
+        floor = FLOOR_TAG in tags
+        return ("WRITE PATH" + (" — FLOOR" if floor else ""),
+                "a write; its cost is dominated by the durable commit, not by lookup"
+                + (". Measured inside a rolled-back transaction, so the true cost is higher"
+                   if floor else ""))
+
+    if access == "ALL" or not indexed:
+        return ("NEEDS PRODUCTION-SCALE VALIDATION",
+                f"full scan ({access}); it examined {rows} row(s) only because the table was "
+                f"small in this dataset. Cheap here, unproven at scale")
+
+    if "REPRESENTATIVE_TABLE_SIZE" in tags:
+        return ("HEALTHY — NO OPTIMISATION REQUIRED",
+                f"indexed {access} access examining {rows} row(s), measured against a "
+                f"representative table size")
+
+    if "SMALL_TABLE_ONLY" in tags:
+        return ("HEALTHY AT THIS DATASET SIZE",
+                f"indexed {access} access examining {rows} row(s), but the table was small in "
+                f"this dataset, so the result does not yet prove behaviour at full scale")
+
+    return (f"INDEXED ({access})", f"examined {rows} row(s)")
+
+
+def _best_label(before_rec: dict[str, Any] | None, after_rec: dict[str, Any] | None,
+                component: str) -> str:
+    """The most informative label available, ignoring one that merely repeats the name."""
+    for record in (before_rec, after_rec):
+        label = (record or {}).get("label") or ""
+        if label and label.strip() != component:
+            return label
+    return (before_rec or after_rec or {}).get("label") or ""
+
+
+def query_catalog() -> list[dict[str, Any]]:
+    """Every measured shape, both states, with where and how often it runs.
+
+    `after_executions` is 0 for a shape the configuration removed from the request path.
+    That is the run's own claim, backed by a live statement trace, and it is what makes the
+    shape's ENTIRE contribution disappear rather than merely shrink.
+    """
+    before = {(r["operation"], r["component"]): r for r in load(BEFORE)}
+    after = {(r["operation"], r["component"]): r for r in load(AFTER)}
+    screens = _screen_map()
+    dropped = set(STATES[AFTER]["zero_execution_operations"])
+
+    out: list[dict[str, Any]] = []
+    for key in sorted(set(before) | set(after)):
+        operation, component = key
+        bucket = _bucket_of(operation, component)
+        b, a = _stats(before.get(key)), _stats(after.get(key))
+        per_screen = screens.get(key, {})
+        before_execs = sum(per_screen.values())
+        removed = operation in dropped
+        after_execs = 0 if removed else before_execs
+
+        verdict, why = health(after.get(key) or before.get(key))
+
+        out.append({
+            "key": key,
+            "shape": f"{PREFIX[bucket]}.{component}",
+            "component": component,
+            "operation": operation,
+            "category": CATEGORY[bucket],
+            "bucket": bucket,
+            # Prefer whichever record carries a DESCRIPTIVE label. The after run fell back
+            # to the bare component name for some shapes; the baseline names them properly,
+            # and a reader is owed the description rather than the identifier repeated.
+            "label": _best_label(before.get(key), after.get(key), component),
+            "screens": [SHORT_TITLES[k] for k in
+                        (p["key"] for p in ui_pages.PAGES) if k in per_screen],
+            "screen_keys": [k for k in (p["key"] for p in ui_pages.PAGES) if k in per_screen],
+            "executions_per_screen": {SHORT_TITLES[k]: v for k, v in per_screen.items()},
+            "before_p50": b["p50"], "before_p95": b["p95"], "before_p99": b["p99"],
+            "before_n": b["n"],
+            "after_p50": a["p50"], "after_p95": a["p95"], "after_p99": a["p99"],
+            "after_n": a["n"],
+            "before_executions": before_execs,
+            "after_executions": after_execs,
+            "removed": removed,
+            "status": STATUS_REMOVED if removed else STATUS_ACTIVE,
+            # A removed shape's improvement is total and unambiguous: its whole contribution
+            # is gone. For a SURVIVING shape the two medians are NOT comparable — see
+            # `calibration_note` — so no improvement figure is offered for one.
+            "sql_time_eliminated": (b["p50"] * before_execs) if removed and b["p50"] else None,
+            "improvement_pct": 100.0 if removed else None,
+            "health": verdict,
+            "health_reason": why,
+            "is_floor": FLOOR_TAG in set(
+                (after.get(key) or before.get(key) or {}).get("evidence") or []),
+            "evidence": sorted(set((after.get(key) or before.get(key) or {}).get("evidence")
+                                   or [])),
+        })
+    return out
+
+
+#: Why a surviving shape's two medians must not be subtracted from one another.
+CALIBRATION_NOTE = (
+    "The two runs were measured on DIFFERENT harnesses. Nothing was changed about the "
+    "business or authentication queries, yet every one of them reads HIGHER in the after "
+    "run — that difference is the harness, not a regression. No per-query improvement "
+    "figure is shown for a surviving shape, because there was no per-query change to report. "
+    "It also means the after-state screen totals are CONSERVATIVE: they were built from the "
+    "more expensive readings and still land under the target."
+)
+
+
+def screen_breakdown(screen_key: str) -> dict[str, Any]:
+    """One screen's query shapes, with each one's contribution and share of the total.
+
+    Percentages are of that screen's own measured total in that state. A shape with no
+    measurement contributes nothing and holds no share — never a zero that reads as free.
+    """
+    before = {p["key"]: p for p in pages(BEFORE)}[screen_key]
+    after = {p["key"]: p for p in pages(AFTER)}[screen_key]
+    catalog = {q["key"]: q for q in query_catalog()}
+
+    after_rows = {(r["operation"], r["component"]): r for r in after["rows"]}
+
+    rows = []
+    for row in before["rows"]:
+        key = (row["operation"], row["component"])
+        q = catalog[key]
+        a = after_rows.get(key)
+        b_contrib = row["contribution_ms"] if row["measured"] else None
+        a_contrib = a["contribution_ms"] if (a and a["measured"]) else None
+        rows.append({
+            "shape": q["shape"],
+            "category": q["category"],
+            "label": q["label"],
+            "before_executions": row["executions"],
+            "after_executions": a["executions"] if a else 0,
+            "before_p50": row["p50"] if row["measured"] else None,
+            "after_p50": a["p50"] if (a and a["measured"]) else None,
+            "before_contribution_ms": b_contrib,
+            "after_contribution_ms": a_contrib,
+            "before_share_pct": (100.0 * b_contrib / before["all_sql_ms"])
+                                if b_contrib and before["all_sql_ms"] else None,
+            "after_share_pct": (100.0 * a_contrib / after["all_sql_ms"])
+                               if a_contrib and after["all_sql_ms"] else None,
+            "removed": a is None,
+            "status": STATUS_REMOVED if a is None else STATUS_ACTIVE,
+            "is_floor": FLOOR_TAG in set(row["evidence"] or []),
+        })
+
+    return {
+        "key": screen_key,
+        "title": SHORT_TITLES[screen_key],
+        "arabic": ARABIC_TITLES.get(screen_key, ""),
+        "route": before["route"],
+        "before_statements": before["query_count"],
+        "after_statements": after["query_count"],
+        "before_ms": before["all_sql_ms"],
+        "after_ms": after["all_sql_ms"],
+        "before_is_complete": before["is_complete"],
+        "after_is_complete": after["is_complete"],
+        "after_is_floor": after["is_lower_bound"],
+        "rows": rows,
+        "conditional": conditional_for(screen_key),
+    }
+
+
+def conditional_for(screen_key: str) -> list[dict[str, str]]:
+    """Shapes a screen declares as CONDITIONAL — code paths that exist but did not execute.
+
+    These carry NO number. A path that never ran has no measured cost, and writing 0 ms
+    would state a measurement that was never taken. It is listed so the screen's statement
+    count cannot be mistaken for the whole of what the code can do.
+    """
+    page = next(p for p in ui_pages.PAGES if p["key"] == screen_key)
+    return [{"name": name, "explanation": text}
+            for name, text in (page.get("conditional_components") or {}).items()]
+
+
+def conditional_queries() -> list[dict[str, str]]:
+    """Every conditional shape across all screens."""
+    out = []
+    for page in ui_pages.PAGES:
+        for item in conditional_for(page["key"]):
+            out.append({**item, "screen": SHORT_TITLES[page["key"]]})
+    return out
+
+
+def query_totals() -> dict[str, Any]:
+    """Journey-wide totals across the seven screens. Every figure is a sum of the above."""
+    before_pages, after_pages = pages(BEFORE), pages(AFTER)
+
+    def bucket_sum(pgs, bucket):
+        return sum(p["bucket_totals"][bucket] for p in pgs)
+
+    b_stmts = sum(p["query_count"] for p in before_pages)
+    a_stmts = sum(p["query_count"] for p in after_pages)
+    b_ms = sum(p["all_sql_ms"] for p in before_pages)
+    a_ms = sum(p["all_sql_ms"] for p in after_pages)
+
+    catalog = query_catalog()
+    return {
+        "screens": len(before_pages),
+        "before_statements": b_stmts,
+        "after_statements": a_stmts,
+        "statements_eliminated": b_stmts - a_stmts,
+        "before_ms": b_ms,
+        "after_ms": a_ms,
+        "ms_saved": b_ms - a_ms,
+        "reduction_pct": (100.0 * (b_ms - a_ms) / b_ms) if b_ms else None,
+        "before_limiter_ms": bucket_sum(before_pages, ui_pages.LIMITER),
+        "before_limiter_pct": (100.0 * bucket_sum(before_pages, ui_pages.LIMITER) / b_ms)
+                              if b_ms else None,
+        "before_business_ms": bucket_sum(before_pages, ui_pages.BUSINESS),
+        "before_auth_ms": bucket_sum(before_pages, ui_pages.AUTH),
+        "after_limiter_ms": bucket_sum(after_pages, ui_pages.LIMITER),
+        "after_business_ms": bucket_sum(after_pages, ui_pages.BUSINESS),
+        "after_business_pct": (100.0 * bucket_sum(after_pages, ui_pages.BUSINESS) / a_ms)
+                              if a_ms else None,
+        "after_auth_ms": bucket_sum(after_pages, ui_pages.AUTH),
+        "shapes_total": len(catalog),
+        "shapes_removed": sum(1 for q in catalog if q["removed"]),
+        "shapes_active": sum(1 for q in catalog if not q["removed"]),
+        "conditional_count": len(conditional_queries()),
+    }

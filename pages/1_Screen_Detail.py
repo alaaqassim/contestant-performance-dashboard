@@ -1,4 +1,9 @@
-"""Per-screen breakdown — where the database time goes on each surface."""
+"""Per-screen query breakdown — which statements make up each screen's database time.
+
+Every screen is shown as the list of statement shapes that contribute to it, with each
+one's execution count, contribution in milliseconds, and share of that screen's total.
+All of it is computed at render time from the two evidence files; no value is written here.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +14,16 @@ from perfdash import evidence, ui_pages
 
 st.set_page_config(page_title="Screen Detail", page_icon="🔍", layout="wide")
 
-st.title("Screen detail — where the time goes")
+st.title("Screen detail — the queries behind each screen")
 st.caption(
-    "Each screen broken into the three kinds of work it does. Statements are named by "
-    "shape; no query text is shown."
+    "Statements are named by shape; no query text, table name or identifier is shown. "
+    "Contribution = measured median × how many times the statement runs on that screen."
 )
 
 try:
+    screens = [evidence.screen_breakdown(p["key"]) for p in ui_pages.PAGES]
     before_pages = {p["key"]: p for p in evidence.pages(evidence.BEFORE)}
     after_pages = {p["key"]: p for p in evidence.pages(evidence.AFTER)}
-    rows = evidence.compare()
 except evidence.EvidenceError as exc:
     st.error(f"**Evidence could not be read.**\n\n`{exc}`", icon="🚫")
     st.stop()
@@ -29,122 +34,163 @@ BUCKET_LABEL = {
     ui_pages.LIMITER: "Rate limiting",
 }
 
-# ======================================================================================
-# Where the cost sat, before and after
-# ======================================================================================
 
-st.header("What each screen was actually spending time on")
+def ms(value: float | None, places: int = 4) -> float | None:
+    return None if value is None else round(value, places)
 
-split = pd.DataFrame([
-    {
-        "Screen": r["short_title"],
-        **{f"{BUCKET_LABEL[b]} — before": round(before_pages[r["key"]]["bucket_totals"][b], 4)
-           for b in ui_pages.BUCKETS},
-        **{f"{BUCKET_LABEL[b]} — after": round(after_pages[r["key"]]["bucket_totals"][b], 4)
-           for b in ui_pages.BUCKETS},
-    }
-    for r in rows
-])
-st.dataframe(split, width="stretch", hide_index=True)
 
-_limiter_share = [
-    (r["short_title"],
-     100.0 * before_pages[r["key"]]["bucket_totals"][ui_pages.LIMITER]
-     / before_pages[r["key"]]["all_sql_ms"])
-    for r in rows if before_pages[r["key"]]["all_sql_ms"]
-]
-st.info(
-    "**Rate limiting was the largest single cost on every screen.** Its share of database "
-    "time before the change: "
-    + " · ".join(f"{name} {share:.1f}%" for name, share in _limiter_share),
-    icon="📊",
-)
+st.warning(evidence.CALIBRATION_NOTE, icon="⚠️")
 
 st.divider()
 
 # ======================================================================================
-# Per-screen expanders
+# Per-screen breakdown
 # ======================================================================================
 
-st.header("Statement-level detail")
-st.caption(
-    "Each statement shape, how often it runs on that screen, and its measured median. "
-    "Contribution = median × number of executions."
-)
+for s in screens:
+    header = f"{s['title']}"
+    if s["arabic"]:
+        header += f"  ·  {s['arabic']}"
+    header += (f"      BEFORE {s['before_statements']} statements / {s['before_ms']:.4f} ms"
+               f"   →   AFTER {s['after_statements']} statement"
+               f"{'s' if s['after_statements'] != 1 else ''} / {s['after_ms']:.4f} ms")
 
-for r in rows:
-    header = f"{r['short_title']}"
-    if r["arabic"]:
-        header += f"  ·  {r['arabic']}"
-    header += f"   —   {r['before_ms']:.4f} ms → {r['after_ms']:.4f} ms" \
-        if r["comparable"] else "   —   incomplete"
+    with st.expander(header, expanded=(s["key"] == "login")):
+        st.caption(f"`{s['route']}`")
 
-    with st.expander(header):
-        st.caption(f"`{r['route']}`")
-        for state, page in (("BEFORE", before_pages[r["key"]]),
-                            ("AFTER", after_pages[r["key"]])):
-            st.markdown(f"**{state}** — {page['query_count']} statements, "
-                        f"{page['all_sql_ms']:.4f} ms total")
-            measured = [row for row in page["rows"] if row["measured"]]
-            if not measured:
-                st.caption("No statements remain on this screen in this state.")
-                continue
-            st.dataframe(
-                pd.DataFrame([
-                    {
-                        "Kind": BUCKET_LABEL[row["bucket"]],
-                        "Statement shape": row["component"],
-                        "What it does": row["label"] if row.get("label") else "",
-                        "Runs": row["executions"],
-                        "Median (ms)": round(row["p50"], 4),
-                        "p95 (ms)": round(row["p95"], 4) if row["p95"] is not None else None,
-                        "p99 (ms)": round(row["p99"], 4) if row["p99"] is not None else None,
-                        "Samples": row["n"],
-                        "Contribution (ms)": round(row["contribution_ms"], 4),
-                        "Note": "floor — understated"
-                                if evidence.FLOOR_TAG in row["evidence"] else "",
-                    }
-                    for row in measured
-                ]),
-                width="stretch", hide_index=True,
+        left, right = st.columns(2)
+        left.metric("BEFORE", f"{s['before_ms']:.4f} ms",
+                    f"{s['before_statements']} statements", delta_color="off")
+        right.metric("AFTER", f"{s['after_ms']:.4f} ms",
+                     f"{s['after_statements']} statement"
+                     f"{'s' if s['after_statements'] != 1 else ''}"
+                     + ("  (floor)" if s["after_is_floor"] else ""), delta_color="off")
+
+        # ---- the query list, in the order the screen issues them --------------------
+        st.markdown("**Queries**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Statement shape": r["shape"],
+                    "Category": r["category"],
+                    "What it does": r["label"],
+                    "Runs BEFORE": r["before_executions"],
+                    "Runs AFTER": r["after_executions"],
+                    "BEFORE p50 (ms)": ms(r["before_p50"]),
+                    "AFTER p50 (ms)": ms(r["after_p50"]),
+                    "Status": "REMOVED" if r["removed"] else (
+                        "floor — understated" if r["is_floor"] else "active"),
+                }
+                for r in s["rows"]
+            ]),
+            width="stretch", hide_index=True,
+        )
+
+        # ---- contribution waterfall -------------------------------------------------
+        st.markdown("**Contribution to this screen's database time**")
+
+        contrib = pd.DataFrame([
+            {
+                "Statement shape": r["shape"],
+                "Runs": r["before_executions"],
+                "BEFORE contribution (ms)": ms(r["before_contribution_ms"]),
+                "BEFORE share": (f"{r['before_share_pct']:.1f}%"
+                                 if r["before_share_pct"] is not None else "—"),
+                "AFTER contribution (ms)": ms(r["after_contribution_ms"]),
+                "AFTER share": (f"{r['after_share_pct']:.1f}%"
+                                if r["after_share_pct"] is not None else "—"),
+            }
+            for r in sorted(s["rows"],
+                            key=lambda r: -(r["before_contribution_ms"] or 0))
+        ])
+        st.dataframe(contrib, width="stretch", hide_index=True)
+
+        chart_before = pd.DataFrame(
+            {"BEFORE contribution (ms)": [r["before_contribution_ms"] or 0.0
+                                          for r in s["rows"]]},
+            index=[r["shape"] for r in s["rows"]],
+        )
+        chart_after = pd.DataFrame(
+            {"AFTER contribution (ms)": [r["after_contribution_ms"] or 0.0
+                                         for r in s["rows"]]},
+            index=[r["shape"] for r in s["rows"]],
+        )
+        bar_l, bar_r = st.columns(2)
+        with bar_l:
+            st.caption("BEFORE — per-statement contribution")
+            st.bar_chart(chart_before, horizontal=True, height=260)
+        with bar_r:
+            st.caption("AFTER — per-statement contribution")
+            st.bar_chart(chart_after, horizontal=True, height=260)
+
+        # ---- bucket split ------------------------------------------------------------
+        st.markdown("**By kind of work**")
+        st.dataframe(
+            pd.DataFrame([
+                {
+                    "Kind": BUCKET_LABEL[bucket],
+                    "BEFORE (ms)": ms(before_pages[s["key"]]["bucket_totals"][bucket]),
+                    "AFTER (ms)": ms(after_pages[s["key"]]["bucket_totals"][bucket]),
+                }
+                for bucket in ui_pages.BUCKETS
+            ]),
+            width="stretch", hide_index=True,
+        )
+
+        if s["after_is_floor"]:
+            st.warning(
+                "This screen's AFTER total is a **FLOOR**, not a value: it includes a write "
+                "measured inside a transaction that was rolled back, so the real committed "
+                "cost is higher. The reduction reported for this screen is therefore "
+                "understated, not overstated.",
+                icon="⚖️",
+            )
+
+        if not (s["before_is_complete"] and s["after_is_complete"]):
+            st.error(
+                "One or more statements on this screen have no measurement. They contribute "
+                "NOTHING to the totals above — never a zero — so the totals are not usable "
+                "as a comparison.",
+                icon="🚫",
+            )
+
+        for item in s["conditional"]:
+            st.info(
+                f"**{item['name']}** — `{evidence.STATUS_CONDITIONAL}`\n\n{item['explanation']}",
+                icon="🚧",
             )
 
 st.divider()
 
 # ======================================================================================
-# What left the request path
+# Cross-screen view
 # ======================================================================================
 
-st.header("What was removed, and what it had cost")
-
-after_records = evidence.load(evidence.AFTER)
-dropped_ops = evidence.STATES[evidence.AFTER]["zero_execution_operations"]
-idle_index = ui_pages.live_index(after_records, set())
-idle = sorted({(r["operation"], r["component"]) for r in after_records
-               if r["operation"] in dropped_ops})
-
-st.markdown(
-    f"**{len(idle)} statement shapes stopped running altogether** — they were not made "
-    f"cheaper, they left the request path. They are still measured below, so the comparison "
-    f"cannot quietly hide what it removed."
-)
+st.header("All seven screens, by kind of work")
 
 st.dataframe(
     pd.DataFrame([
         {
-            "Statement shape": comp,
-            "What it did": (idle_index[(op, comp)].get("label") or ""),
-            "Median cost when it ran (ms)": round(
-                (ui_pages.stats.stats_for(idle_index[(op, comp)]) or {}).get("median_ms", 0.0), 4),
-            "Times it now runs": 0,
+            "Screen": s["title"],
+            **{f"{BUCKET_LABEL[b]} — before":
+               ms(before_pages[s["key"]]["bucket_totals"][b]) for b in ui_pages.BUCKETS},
+            **{f"{BUCKET_LABEL[b]} — after":
+               ms(after_pages[s["key"]]["bucket_totals"][b]) for b in ui_pages.BUCKETS},
         }
-        for op, comp in idle
+        for s in screens
     ]),
     width="stretch", hide_index=True,
 )
 
-st.caption(
-    "The two most expensive shapes here are database WRITES. Every throttled request "
-    "performed at least one, and each had to be flushed durably to disk — which is why "
-    "rate limiting dominated the budget rather than the application's own queries."
+_share = [
+    (s["title"],
+     100.0 * before_pages[s["key"]]["bucket_totals"][ui_pages.LIMITER]
+     / before_pages[s["key"]]["all_sql_ms"])
+    for s in screens if before_pages[s["key"]]["all_sql_ms"]
+]
+st.info(
+    "**Rate limiting was the largest single cost on every screen.** Its share of database "
+    "time before the change: "
+    + " · ".join(f"{name} {pct:.1f}%" for name, pct in _share),
+    icon="📊",
 )

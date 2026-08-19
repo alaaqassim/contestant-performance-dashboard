@@ -8,8 +8,11 @@ measurement ledger. They were produced mechanically from that ledger, not transc
 * every timing sample, and therefore every median, p95 and p99
 * statement counts and per-screen execution frequencies
 * the provenance of each figure: how it was generated, from what source, for which phase
-* the full evidence-tag list, including **`ROLLBACK_LOWER_BOUND`** — the tag that makes
-  the Apply screen's total a FLOOR rather than a value
+* the full evidence-tag list, including **`ROLLBACK_LOWER_BOUND`** (the tag that makes the
+  Apply screen's total a FLOOR), **`SMALL_TABLE_ONLY`** and **`REPRESENTATIVE_TABLE_SIZE`**
+  (which is what lets a query be called healthy, or not, without guessing)
+* the access plan CLASS (`const`, `ref`, `ALL`, `insert`), the rows examined, and whether
+  an index was used — the facts a reader needs to judge a query, minus the schema
 * the BEFORE / AFTER distinction, carried by separate files and separate run identifiers
 * the content hash of each original record, so any figure here can be traced back to the
   internal ledger entry it came from
@@ -25,7 +28,9 @@ that were removed.
 
 | Field | Reason |
 |---|---|
-| `database` | the entire object — statement text, table name, index name, rows examined, access type. Query-level internals; the public app names shapes only |
+| `database.sql_fingerprint` | the parameterised statement text |
+| `database.table` | the table name |
+| `database.index_used` | the index name, which would disclose schema. REPLACED by a boolean `indexed` recording only WHETHER an index was used |
 | `notes` | long internal engineering commentary; it contained a loopback address, a security-related keyword, statement text and row-level identifiers |
 | `conditions_caveats` | internal caveat prose containing an absolute local path and row-level identifiers. REPLACED with curated public text; the machine-readable evidence tags (including ROLLBACK_LOWER_BOUND) are preserved unchanged |
 | `supersedes` | ledger bookkeeping — ids of retired records not present in the snapshot |
