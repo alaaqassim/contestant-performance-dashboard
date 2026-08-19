@@ -1,0 +1,31 @@
+# Secrets and environment
+.env
+.env.*
+secrets.toml
+.streamlit/secrets.toml
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Python runtime state
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache/
+
+# Databases: this snapshot ships none, and must never acquire one.
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
